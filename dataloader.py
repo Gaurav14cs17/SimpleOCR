@@ -34,32 +34,33 @@ def four_point_transform(image: np.ndarray, coords: List[int],
     """
     # Convert coordinates to 4 points
     x1, y1, x2, y2 = coords
-    pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-
-    rect = order_points(np.array(pts))
-    (tl, tr, br, bl) = rect
-
-    # Compute new width and height
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-
-    # Destination points
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-
-    # Compute perspective transform and apply it
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-
-    # Resize to desired output
+    warped = image[y1:y2 , x1:x2 ]
+    # pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    #
+    # rect = order_points(np.array(pts))
+    # (tl, tr, br, bl) = rect
+    #
+    # # Compute new width and height
+    # widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    # widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    # maxWidth = max(int(widthA), int(widthB))
+    #
+    # heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    # heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    # maxHeight = max(int(heightA), int(heightB))
+    #
+    # # Destination points
+    # dst = np.array([
+    #     [0, 0],
+    #     [maxWidth - 1, 0],
+    #     [maxWidth - 1, maxHeight - 1],
+    #     [0, maxHeight - 1]], dtype="float32")
+    #
+    # # Compute perspective transform and apply it
+    # M = cv2.getPerspectiveTransform(rect, dst)
+    # warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    #
+    # # Resize to desired output
     warped = cv2.resize(warped, output_size)
     return warped
 
@@ -137,7 +138,7 @@ class OCRDataset(Dataset):
 
         # Apply perspective transform
         warped = four_point_transform(image, annotation['coords'],(self.img_width, self.img_height))
-        #cv2.imwrite("image.png" , warped )
+        cv2.imwrite("image.png" , warped )
 
         # Normalize and add channel dimension
         warped = warped.astype(np.float32) / 255.0
@@ -201,7 +202,7 @@ if __name__ == "__main__":
         annotation_dir='D:/synlabs/contrain_ocr/Data/train_images/labels',
         image_dir='D:/synlabs/contrain_ocr/Data/train_images/images',
         char_to_int=char_to_int,
-        img_size=(100, 32)
+        img_size=(350//2, 180//2)
     )
 
     print(f"Total annotations: {len(dataset)}")
