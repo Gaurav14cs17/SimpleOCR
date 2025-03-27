@@ -1,140 +1,229 @@
 import os
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-import cv2
-from PIL import Image
+from typing import List, Dict, Tuple, Optional
 
 
-class TextRecognitionDataset(Dataset):
-    """ Class for working with training datasets in PyTorch. """
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Order coordinates in consistent [top-left, top-right, bottom-right, bottom-left] order."""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]  # top-left
+    rect[2] = pts[np.argmax(s)]  # bottom-right
 
-    def __init__(self, annotation_path, image_width, image_height, transform=None, shuffle=False):
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    return rect
+
+
+def four_point_transform(image: np.ndarray, coords: List[int],
+                         output_size: Tuple[int, int] = (100, 32)) -> np.ndarray:
+    """
+    Apply perspective transform to crop and straighten text region.
+
+    Args:
+        image: Input image (grayscale or color)
+        coords: List of 4 coordinates [x1,y1,x2,y2]
+        output_size: Desired output (width, height)
+
+    Returns:
+        Warped image
+    """
+    # Convert coordinates to 4 points
+    x1, y1, x2, y2 = coords
+    pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+    rect = order_points(np.array(pts))
+    (tl, tr, br, bl) = rect
+
+    # Compute new width and height
+    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    maxWidth = max(int(widthA), int(widthB))
+
+    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    maxHeight = max(int(heightA), int(heightB))
+
+    # Destination points
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
+    # Compute perspective transform and apply it
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+
+    # Resize to desired output
+    warped = cv2.resize(warped, output_size)
+    return warped
+
+
+class OCRDataset(Dataset):
+    def __init__(self, annotation_dir: str, image_dir: str, char_to_int: Dict[str, int],
+                 img_size: Tuple[int, int] = (100, 32), transform=None):
         """
+        OCR Dataset for format: x1,y1,x2,y2,text
+
         Args:
-            annotation_path (str): Path to annotation file
-            image_width (int): Target image width
-            image_height (int): Target image height
-            transform (callable, optional): Optional transform to be applied
-            shuffle (bool): Whether to shuffle the dataset
+            annotation_dir: Directory containing annotation files
+            image_dir: Directory containing images
+            char_to_int: Character mapping dictionary
+            img_size: Output image size (width, height)
+            transform: Optional transforms
         """
-        self.image_paths, self.labels = self.parse_datasets_arg(annotation_path)
-        self.image_width = image_width
-        self.image_height = image_height
+        self.annotation_files = [f for f in os.listdir(annotation_dir) if f.endswith('.txt')]
+        self.annotation_dir = annotation_dir
+        self.image_dir = image_dir
+        self.char_to_int = char_to_int
+        self.img_width, self.img_height = img_size
         self.transform = transform
-        self.char_to_int, self.int_to_char, self.num_classes = self.create_character_maps()
 
-        if shuffle:
-            self.shuffle_data()
+        # Pre-load all annotations with unique IDs
+        self.annotations = []
+        self.annotation_map = {}  # Maps annotation IDs to (file_idx, annotation_idx)
 
-    def __len__(self):
-        return len(self.image_paths)
+        for file_idx, file_name in enumerate(self.annotation_files):
+            file_path = os.path.join(self.annotation_dir, file_name)
+            file_annotations = self._load_annotation(file_path)
 
-    def __getitem__(self, idx):
-        image_path = self.image_paths[idx]
-        label = self.labels[idx]
+            for ann_idx, annotation in enumerate(file_annotations):
+                unique_id = len(self.annotations)
+                self.annotations.append(annotation)
+                self.annotation_map[unique_id] = (file_idx, ann_idx)
 
-        try:
-            # Read and preprocess image
-            image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"Could not read image at {image_path}")
+    def _load_annotation(self, file_path: str) -> List[Dict]:
+        """Load annotation from a single file in format: x1,y1,x2,y2,text"""
+        annotations = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) >= 5:
+                    try:
+                        x1, y1, x2, y2 = map(int, parts[:4])
+                        text = ','.join(parts[4:]).strip()  # Handle text with commas
+                        if text:  # Only add if text exists
+                            annotations.append({
+                                'coords': [x1, y1, x2, y2],
+                                'text': text,
+                                'points': [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]  # Convert to 4 points
+                            })
+                    except ValueError:
+                        continue  # Skip malformed lines
+        return annotations
 
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    def __len__(self) -> int:
+        return len(self.annotations)
 
-            # For vertical image
-            image = image.transpose((1, 0))
-            image = image[::-1]
-            image = image.astype(np.float32)
-            image = cv2.resize(image, (self.image_width, self.image_height))
-            image = np.expand_dims(image, axis=0)  # Add channel dimension
+    def __getitem__(self, idx: int) -> Dict:
+        annotation = self.annotations[idx]
+        file_idx, ann_idx = self.annotation_map[idx]
+        file_name = self.annotation_files[file_idx]
+        base_name = os.path.splitext(file_name)[0]
 
-            # Convert label to integer array
-            label_int = np.array([self.char_to_int[char] for char in label.lower()], dtype=np.int32)
+        # Load corresponding image
+        img_path = os.path.join(self.image_dir, f"{base_name}.jpg")
+        image = cv2.imread(img_path)
+        if image is None:
+            raise FileNotFoundError(f"Image not found: {img_path}")
 
-            if self.transform:
-                image = self.transform(image)
+        # Convert to grayscale
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-            return torch.from_numpy(image), torch.from_numpy(label_int), label
+        # Apply perspective transform
+        warped = four_point_transform(image, annotation['coords'],(self.img_width, self.img_height))
+        #cv2.imwrite("image.png" , warped )
 
-        except Exception as e:
-            print(f"Error processing image: {image_path}")
-            raise e
+        # Normalize and add channel dimension
+        warped = warped.astype(np.float32) / 255.0
+        warped = np.expand_dims(warped, axis=0)  # [1, H, W]
 
-    def shuffle_data(self):
-        """Shuffles the dataset."""
-        combined = list(zip(self.image_paths, self.labels))
-        np.random.shuffle(combined)
-        self.image_paths, self.labels = zip(*combined)
+        # Convert text to indices
+        text = annotation['text'].upper()  # Assuming case-insensitive
+        text_int = torch.tensor(
+            [self.char_to_int[c] for c in text if c in self.char_to_int],
+            dtype=torch.long
+        )
 
-    @staticmethod
-    def create_character_maps():
-        """ Creates character-to-int and int-to-character maps. """
-        alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
-        char_to_int = {char: i for i, char in enumerate(alphabet)}
-        int_to_char = list(alphabet)
-        return char_to_int, int_to_char, len(char_to_int) + 1
+        if self.transform:
+            warped = self.transform(warped)
 
-    @staticmethod
-    def parse_datasets_arg(annotation_path):
-        """ Parses datasets argument. """
-        image_paths = []
-        labels = []
-
-        for ann_path in annotation_path.split(','):
-            annotation_folder = os.path.dirname(ann_path)
-            annotation_folder = os.path.join("/home/gaurav/path/to/clone/text_recognition", annotation_folder)
-
-            with open(ann_path, encoding="utf-8-sig") as f:
-                for line in f:
-                    line = line.strip().split()
-                    if len(line) >= 2:  # Ensure we have both path and label
-                        img_path = os.path.join(annotation_folder, line[0])
-                        image_paths.append(img_path)
-                        labels.append(line[1])
-
-        return image_paths, labels
-
-    @staticmethod
-    def collate_fn(batch):
-        """
-        Custom collate function to handle variable-length labels.
-        Returns:
-            images: Tensor of shape (batch_size, 1, H, W)
-            labels: List of tensors with variable length
-            label_strings: List of original label strings
-        """
-        images = torch.stack([item[0] for item in batch])
-        labels = [item[1] for item in batch]
-        label_strings = [item[2] for item in batch]
-
-        return images, labels, label_strings
+        return {
+            'image': torch.from_numpy(warped),
+            'text': text,
+            'text_int': text_int,  # This can be variable length
+            'coords': torch.tensor(annotation['coords'], dtype=torch.float),
+            'File_Name ' : base_name
+        }
 
 
-# Example usage:
+def collate_fn(batch):
+    """Custom collate function to handle variable-length sequences"""
+    images = torch.stack([item['image'] for item in batch])
+    coords = torch.stack([item['coords'] for item in batch])
+
+    # Handle variable-length text sequences
+    texts = [item['text'] for item in batch]
+    text_ints = [item['text_int'] for item in batch]
+
+    # Get lengths of each sequence
+    text_lens = torch.tensor([len(t) for t in text_ints], dtype=torch.long)
+
+    # Pad sequences to maximum length in batch
+    max_len = max(text_lens) if len(text_lens) > 0 else 0
+    padded_text = torch.zeros(len(batch), max_len, dtype=torch.long)
+    for i, text in enumerate(text_ints):
+        if len(text) > 0:  # Only copy if text is not empty
+            padded_text[i, :len(text)] = text
+
+    return {
+        'image': images,
+        'text': texts,
+        'text_int': padded_text,
+        'text_len': text_lens,
+        'coords': coords
+    }
+
+
+# Example usage
 if __name__ == "__main__":
+    # Create character mappings
+    chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    char_to_int = {c: i for i, c in enumerate(chars)}
+
     # Initialize dataset
-    dataset = TextRecognitionDataset(
-        annotation_path="path/to/annotations.txt",
-        image_width=100,
-        image_height=32
+    dataset = OCRDataset(
+        annotation_dir='D:/synlabs/contrain_ocr/Data/train_images/labels',
+        image_dir='D:/synlabs/contrain_ocr/Data/train_images/images',
+        char_to_int=char_to_int,
+        img_size=(100, 32)
     )
 
-    # Create DataLoader
+    print(f"Total annotations: {len(dataset)}")
+
+    # Create dataloader with custom collate function
     dataloader = DataLoader(
         dataset,
-        batch_size=32,
+        batch_size=8,
         shuffle=True,
-        collate_fn=TextRecognitionDataset.collate_fn,
-        num_workers=4
+        collate_fn=collate_fn
     )
 
-    # Iterate through batches
-    for images, labels, label_strings in dataloader:
-        # images: (batch_size, 1, H, W)
-        # labels: list of tensors with variable length
-        # label_strings: list of original strings
-        print(images.shape)
-        print(len(labels))
-        print(label_strings)
+    # Example batch
+    for batch in dataloader:
+        print(batch['text_int'])
+        print(f"\nBatch details:")
+        print(f"Image batch shape: {batch['image'].shape}")  # Should be [batch_size, 1, H, W]
+        print(f"Text samples: {batch['text']}")
+        print(f"Padded text indices shape: {batch['text_int'].shape}")
+        print(f"Text lengths: {batch['text_len']}")
+        print(f"Coordinates shape: {batch['coords'].shape}")  # Should be [batch_size, 4]
+
+        print("----------------------"*5)
+        print("***"*10)
         break
